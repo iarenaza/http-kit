@@ -236,14 +236,17 @@
       (catch Exception _ nil))))
 
 (defn send-checked-websocket-handshake!
-  "Given an AsyncChannel and `sec-ws-accept` string, unconditionally
-  sends handshake to upgrade given AsyncChannel to a WebSocket.
-  See also `websocket-handshake-check`."
-  [^AsyncChannel ch ^String sec-ws-accept]
-  (.sendHandshake ch
-    {"Upgrade" "websocket"
-     "Connection" "Upgrade"
-     "Sec-WebSocket-Accept" sec-ws-accept}))
+  "Given an AsyncChannel, `sec-ws-accept` string and an optional map of
+  extra `headers`, unconditionally sends handshake to upgrade given
+  AsyncChannel to a WebSocket. See also `websocket-handshake-check`."
+  ([^AsyncChannel ch ^String sec-ws-accept]
+   (send-checked-websocket-handshake! ch sec-ws-accept {}))
+  ([^AsyncChannel ch ^String sec-ws-accept headers]
+   (let [headers (into (or headers {})
+                       {"Upgrade" "websocket"
+                        "Connection" "Upgrade"
+                        "Sec-WebSocket-Accept" sec-ws-accept})]
+     (.sendHandshake ch headers))))
 
 (defn send-websocket-handshake!
   "Returns true iff successfully upgraded a valid WebSocket request."
@@ -345,11 +348,12 @@
   asynchronous HTTP or WebSocket `AsyncChannel`.
 
   Main options:
-    :init       - (fn [ch])             for misc pre-handshake setup.
-    :on-receive - (fn [ch message])     called for client WebSocket messages.
-    :on-ping    - (fn [ch data])        called for client WebSocket pings.
-    :on-close   - (fn [ch status-code]) called when AsyncChannel is closed.
-    :on-open    - (fn [ch])             called when AsyncChannel is ready for `send!`, etc.
+    :init              - (fn [ch])             for misc pre-handshake setup.
+    :pre-ws-handshake  - (fn [ch ring-req])    called to accept/deny websocket upgrades, can return extra response headers.
+    :on-receive        - (fn [ch message])     called for client WebSocket messages.
+    :on-ping           - (fn [ch data])        called for client WebSocket pings.
+    :on-close          - (fn [ch status-code]) called when AsyncChannel is closed.
+    :on-open           - (fn [ch])             called when AsyncChannel is ready for `send!`, etc.
 
   See `Channel` protocol for more info on handlers and `AsyncChannel`s.
   See `org.httpkit.timer` ns for optional timeout utils.
@@ -381,8 +385,10 @@
            :on-close   (fn [ch status-code] (println \"on-close:\"   status-code))
            :on-open    (fn [ch]             (println \"on-open:\"    ch))})))"
 
-  [ring-req {:keys [on-receive on-ping on-close on-open init on-handshake-error]
-             :or   {on-handshake-error (fn [ch] (send! ch bad-ring-websocket-resp true))}}]
+  [ring-req {:keys [on-receive on-ping on-close on-open init on-handshake-error pre-ws-handshake]
+             :or   {on-handshake-error (fn [ch] (send! ch bad-ring-websocket-resp true))
+                    pre-ws-handshake   (fn [_ch _ring-req]
+                                         {:do-handshake true, :handshake-extra-headers {}, :no-handshake-ring-resp {}})}}]
 
   (when-let [ch (:async-channel ring-req)]
 
@@ -394,8 +400,13 @@
         (do
           (when-let [f on-receive] (org.httpkit.server/on-receive ch (partial f ch)))
           (when-let [f on-ping]    (org.httpkit.server/on-ping    ch (partial f ch)))
-          (send-checked-websocket-handshake! ch sec-ws-accept)
-          (when-let [f on-open] (f ch)))
+          (let [{:keys [do-handshake handshake-extra-headers no-handshake-ring-resp]}
+                (when-let [f pre-ws-handshake] (f ch ring-req))]
+            (if do-handshake
+              (do
+                (send-checked-websocket-handshake! ch sec-ws-accept handshake-extra-headers)
+                (when-let [f on-open] (f ch)))
+              (send! ch no-handshake-ring-resp true))))
         (when-let [f on-handshake-error] (f ch)))
       (when-let [f on-open] (f ch)))
 
